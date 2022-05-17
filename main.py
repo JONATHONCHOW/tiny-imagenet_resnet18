@@ -19,12 +19,16 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+from torch.utils.tensorboard import SummaryWriter
+
+writer = SummaryWriter()
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
                      and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
+# enter parameters in "Run" or "Command Line"
 parser.add_argument('data', metavar='DIR', default='imagenet',
                     help='path to dataset (default: imagenet)')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
@@ -138,6 +142,10 @@ def main_worker(gpu, ngpus_per_node, args):
         print("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch]()
 
+    # change output dimension from 1000 to 200
+    input_num = model.fc.in_features
+    model.fc = nn.Linear(input_num, 200)
+
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
     elif args.distributed:
@@ -213,8 +221,8 @@ def main_worker(gpu, ngpus_per_node, args):
     train_dataset = datasets.ImageFolder(
         traindir,
         transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
+            # transforms.RandomResizedCrop(224),
+            # transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             normalize,
         ]))
@@ -230,8 +238,8 @@ def main_worker(gpu, ngpus_per_node, args):
 
     val_loader = torch.utils.data.DataLoader(
         datasets.ImageFolder(valdir, transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
+            # transforms.Resize(256),
+            # transforms.CenterCrop(224),
             transforms.ToTensor(),
             normalize,
         ])),
@@ -247,12 +255,19 @@ def main_worker(gpu, ngpus_per_node, args):
             train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        losses_train, acc5_train, acc1_train = train(train_loader, model, criterion, optimizer, epoch, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        losses, acc5, acc1 = validate(val_loader, model, criterion, args)
 
         scheduler.step()
+
+        writer.add_scalar('Train/Loss', losses_train, epoch)
+        writer.add_scalar('Train/Top5', acc5_train, epoch)
+        writer.add_scalar('Train/Top1', acc1_train, epoch)
+        writer.add_scalar('Validate/Loss', losses, epoch)
+        writer.add_scalar('Validate/Top5', acc5, epoch)
+        writer.add_scalar('Validate/Top1', acc1, epoch)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -267,7 +282,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 'best_acc1': best_acc1,
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict()
-            }, is_best)
+            }, is_best, "checkpoint{}.pth.tar".format(epoch + 1))
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -315,6 +330,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+    return loss, top5.avg, top1.avg
 
 
 def validate(val_loader, model, criterion, args):
@@ -342,6 +358,17 @@ def validate(val_loader, model, criterion, args):
             output = model(images)
             loss = criterion(output, target)
 
+            # compute output in evaluation
+            if args.evaluate:
+                # find max
+                _, pred = output.topk(5, 1, True, True)
+                pred = pred.t()
+                if i == 0:
+                    save = pred
+                else:
+                    save = torch.cat((save, pred), 1)
+                continue
+
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
             losses.update(loss.item(), images.size(0))
@@ -355,9 +382,13 @@ def validate(val_loader, model, criterion, args):
             if i % args.print_freq == 0:
                 progress.display(i)
 
+        if args.evaluate:
+            torch.save(save, "epoch" + str(args.start_epoch) + ".dat")
+            return
+
         progress.display_summary()
 
-    return top1.avg
+    return loss, top5.avg, top1.avg
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
